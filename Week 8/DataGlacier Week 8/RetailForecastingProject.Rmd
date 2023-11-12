@@ -1,0 +1,25 @@
+---
+title: "Retail Forecasting Project"
+author: "Jie Heng Yu"
+date: "11/11/2023"
+output: html_document
+---
+
+```{r, include = FALSE}
+library(tidyverse)
+```
+
+# Retail Forecasting Project
+
+### Data Preparation
+
+```{r}
+retailDF <- as_tibble(read.csv('ForecastingCaseStudy.csv'))
+head(retailDF)
+
+# Check for missing data
+colSums(is.na(retailDF))
+# Check for extreme outliers
+ggplot(retailDF, aes(y = Sales)) +
+  geom_boxplot()
+```
