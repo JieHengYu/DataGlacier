@@ -1,0 +1,38 @@
+---
+title: "Retail Forecasting Project"
+author: "Jie Heng Yu"
+date: "11/11/2023"
+output: html_document
+---
+
+```{r, include = FALSE}
+library(tidyverse)
+library(lubridate)
+```
+
+# Retail Forecasting Project
+
+### Data Preparation
+
+```{r}
+retailDF <- as_tibble(read.csv('ForecastingCaseStudy.csv'))
+head(retailDF)
+
+# Look for missing data
+colSums(is.na(retailDF))
+# Look for outliers
+ggplot(retailDF, aes(y = Sales)) +
+  geom_boxplot()
+
+# Rename columns
+colnames(retailDF)[4] <- 'Price.Discount(%)'
+colnames(retailDF)[10:12] <- c('Valentines Day', 'Easter', 'Christmas')
+# Recode date times to week year
+retailDF$date <- as.Date(retailDF$date, '%m/%d/%Y')
+retailDF <- mutate(retailDF, Week = isoweek(ymd(retailDF$date)), Year = isoyear(ymd(retailDF$date)))
+# Remove % from Price Discount (%)
+retailDF$`Price.Discount(%)` <- str_remove(retailDF$`Price.Discount(%)`, '%')
+# Remove date column
+retailDF <- select(retailDF, -date)
+retailDF
+```
