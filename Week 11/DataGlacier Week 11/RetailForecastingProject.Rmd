@@ -1,0 +1,104 @@
+---
+title: "Retail Forecasting Project"
+author: "Jie Heng Yu"
+date: "11/11/2023"
+output: html_document
+---
+
+```{r, include = FALSE}
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(plotly)
+```
+
+# Retail Forecasting Project
+
+### Data Preparation
+
+We save our read data to variable `retailDF`. The data is prepared by renaming columns, recoding the columns, & searching for missing values/outliers. We will keep outliers in our dataset because they are representations of the population-level observation. Also, the company's product demand is influenced by factors such as holidays & seasonality, so I want to make sure that these extreme outliers are accounted for & explained.
+
+```{r}
+retailDF <- as_tibble(read.csv('ForecastingCaseStudy.csv'))
+head(retailDF)
+
+# Look for missing data
+colSums(is.na(retailDF))
+# Look for outliers
+ggplot(retailDF, aes(x = '', y = Sales)) +
+  geom_violin(width = 1.2) +
+  geom_boxplot(width = 0.1, color = 'black', alpha = 0.5) +
+  theme_bw() +
+  labs(title = 'Distribution of Sales')
+
+# Rename columns
+colnames(retailDF)[4] <- 'Price.Discount(%)'
+colnames(retailDF)[10:12] <- c('Valentines Day', 'Easter', 'Christmas')
+# Recode date times to week year
+retailDF$date <- as.Date(retailDF$date, '%m/%d/%Y')
+retailDF <- mutate(retailDF, Week = isoweek(ymd(retailDF$date)), Year = isoyear(ymd(retailDF$date)))
+# Remove % from Price Discount (%)
+retailDF$`Price.Discount(%)` <- as.numeric(str_remove(retailDF$`Price.Discount(%)`, '%'))
+# Remove date column
+retailDF <- select(retailDF, -date)
+# Recode products column to be numeric
+retailDF$Product <- recode(retailDF$Product, 'SKU1' = 1, 'SKU2' = 2, 'SKU3' = 3, 'SKU4' = 4, 'SKU5' = 5, 'SKU6' = 6)
+retailDF
+```
+
+### Exploratory Data Analysis
+
+Since there are quite a lot of variables in this dataset, we will see if we can remove some of the extraneous variables by estimating the variables' importance. This method uses the area under the ROC curve as score for determining which predictor variables have the greatest relationship with our outcome variable.
+
+```{r}
+rocCurveImportance <- filterVarImp(x = retailDF[, -2], y = retailDF$Sales)
+rocCurveImportance <- as_tibble(data.frame(cbind(variable = rownames(rocCurveImportance), score = rocCurveImportance[, 1])))
+rocCurveImportance$score <- as.double(rocCurveImportance$score)
+rocCurveImportance <- rocCurveImportance[order(rocCurveImportance$score, decreasing = TRUE), ]
+ggplot(rocCurveImportance, aes(x = reorder(variable, score), y = score)) +
+  geom_point() +
+  geom_segment(aes(x = variable, xend = variable, y = 0, yend = score)) +
+  labs(x = 'Variable', y = 'Area Under the ROC Curve (Importance)', title = 'Variable Importance') +
+  coord_flip() +
+  theme_bw()
+rocCurveImportance
+```
+
+Based on the visualization, it seems that `Product`, the 3 promos variables,  & `Covid_Flag` are the most important in explaining the variability in sales. Those variables will need to be included as our final set of predictor variables when it comes time to build out regression model. Intuition might want us to include `Christmas` as one of our predictor variables as well, because families do a lot of shopping for the holidays. Whether or not customers want to buy this company's products for the holidays is a completely different story, though. I will include it based off the problem statement, 'Their demand is influenced by various factors like holidays & seasonality.' I think I would like to keep our predictor variables to those variables.
+
+Let's create a simple model with our chosen variables to see if our selections are any good.
+
+```{r}
+finalRetailDF <- select(retailDF, Product, Sales, In.Store.Promo, Store.End.Promo, Catalogue.Promo, Covid_Flag, Christmas)
+finalRetailDF
+summary(lm(Sales ~ ., data = finalRetailDF))
+```
+
+Although we selected our most important variables, this does not help us create a model that explain most of the variability in our outcome variable (Our R^2 value is very low). While individually, these variables are assigned a score that indicates that they contribute the most to predicting our outcome variable, they may not combine together well to help use build a model that will explain the majority of the variability in sales. 
+
+Let's try another feature selection method. This method is called recursive feature elimination (RFE). Features are automatically ranked by their scaled coefficients & importance, then recursively eliminated per loop. Because RFE does not know how many features are valid, the process is cross-validated to find the best scoring collection of features.
+
+```{r}
+resampleCtrl <- rfeControl(functions = rfFuncs, method = 'cv', number = 10, repeats = 3)
+rfe(x = retailDF[, -2], y = retailDF$Sales, sizes = c(1, 3:13), rfeControl = resampleCtrl)
+```
+
+The results of our RFE states that our best combination of features is `Price.Discount(%)`, `Product`, `Year`, `Store.End.Promo`, & `Week`. Let's take those features & create a model to see if our choices of features are any better at predicting the sales.
+
+```{r}
+finalRetailDF <- select(retailDF, Sales, Product, `Price.Discount(%)`, Week, Year, Store.End.Promo)
+finalRetailDF
+summary(lm(Sales ~ ., data = finalRetailDF))
+```
+
+Our R-squared value has improved a bit, so we're stepping in the right direction. However, a R^2 value of 0.22 is still low, so we will have to try another method. This time, let's try using the Akaike Information Criterion (AIC). Much like RFE, AIC iteratively removes predictor variables least significantly related to the outcome variable until all of them are significantly associated to the outcome variable. AIC's goal is to create the best model with the least number of coefficients possible, measuring based on its AIC score. This score is a compromise between the quality of the model fit & its complexity.
+
+```{r}
+summary(step(lm(Sales ~ ., data = retailDF), trace = FALSE))
+```
+
+Interesting! The results of our AIC deems our selected variables from our 'feature importance' example good variables for model building. Our R-squared value is also slightly higher at 0.29. In addition to those variables, our AIC chosen model also include week & year. The week & year features may help to explain the change in sales numbers throughout the holidays & seasons. Let's go with our variables selected from our AIC.
+
+### Final Recommendation
+
+Since most of our predictor variables are binary/categorical, I think it would be very fitting if we use a decision tree with random forests boosting to predict our sales.
