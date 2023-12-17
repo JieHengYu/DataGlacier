@@ -1,0 +1,375 @@
+---
+title: "Retail Forecasting Project Model"
+author: "Jie Heng Yu"
+date: "December 30, 2023"             
+output: html_document
+runtime: shiny
+---
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(parallel)
+library(parallelMap)
+library(randomForest)
+```
+
+# Retail Forecasting Project
+
+### Data Preparation
+
+We'll transform our data so that it only has the variables based off the results of the AIC-selected model from our EDA.
+
+```{r}
+retailDF <- as_tibble(read.csv('ForecastingCaseStudy.csv'))
+# Rename columns
+colnames(retailDF)[4] <- 'PriceDiscount'
+colnames(retailDF)[10:12] <- c('Valentines Day', 'Easter', 'Christmas')
+# Recode date times to week year
+retailDF$date <- as.Date(retailDF$date, '%m/%d/%Y')
+retailDF <- mutate(retailDF, Week = isoweek(ymd(retailDF$date)), Year = isoyear(ymd(retailDF$date)))
+# Remove % from Price Discount (%)
+retailDF$PriceDiscount <- as.numeric(str_remove(retailDF$PriceDiscount, '%'))
+# Remove date column
+retailDF <- select(retailDF, -date)
+# Recode products column to be numeric
+retailDF$Product <- recode(retailDF$Product, 'SKU1' = 1, 'SKU2' = 2, 'SKU3' = 3, 'SKU4' = 4, 'SKU5' = 5, 'SKU6' = 6)
+colnames(retailDF)[4:6] <- c('In_Store_Promo', 'Catalogue_Promo', 'Store_End_Promo')
+colnames(retailDF)[9] <- 'Valentines_Day'
+retailDF
+```
+
+We'll remove the outliers from our data based on our Sales feature. Outliers in statistical research settings are anything below 25th quartile - 1.5 IQR, or anything above 75th quartile + 1.5 IQR. IQR refers to the inter-quartile range, which is the 75th quartile - 25th quartile. It should be removing large sales numbers only -- can't imagine there being negative sales -- I could be wrong.
+
+```{r}
+quant25 <- quantile(retailDF$Sales, c(0, 0.25, 0.5, 0.75, 1))[[2]]
+quant75 <- quantile(retailDF$Sales, c(0, 0.25, 0.5, 0.75, 1))[[4]]
+retailDF <- filter(retailDF, Sales > (quant25 - 3 * (quant75 - quant25)) & Sales < (quant75 + 3 * (quant75 - quant25)))
+retailDF
+```
+
+Let's also reduce our dataset to our AIC-selected variables.
+
+```{r}
+retailDF <- select(retailDF, Sales, Product, In_Store_Promo, PriceDiscount, Catalogue_Promo, Store_End_Promo, Covid_Flag, Christmas, Week, Year)
+retailDF
+```
+
+We'll also have to recode our PriceDiscount feature. We'll put the observations into buckets of 10. PriceDiscount will then almost like a polytomous factor in our data set, so we will turn it into a set of k - 1 dummy variables that will contain the same information, all of which are independent but are references of a level of the factor. This will make more sense when I explain it in my presentation. The reason for doing so is to create a model that won't have a unreasonably large MSE, mean squared error, which is a standardized measure of error for regression models.
+
+```{r}
+unique(retailDF$PriceDiscount)
+retailDF$PriceDiscount <- case_when(retailDF$PriceDiscount %in% 1:10 ~ 1,
+                                    retailDF$PriceDiscount %in% 11:20 ~ 2,
+                                    retailDF$PriceDiscount %in% 21:30 ~ 3,
+                                    retailDF$PriceDiscount %in% 31:40 ~ 4,
+                                    retailDF$PriceDiscount %in% 41:50 ~ 5,
+                                    retailDF$PriceDiscount %in% 51:60 ~ 6,
+                                    retailDF$PriceDiscount %in% 61:70 ~ 7,
+                                    retailDF$PriceDiscount %in% 71:80 ~ 8,
+                                    retailDF$PriceDiscount %in% 81:90 ~ 9,
+                                    retailDF$PriceDiscount %in% 91:100 ~ 10,
+                                    TRUE ~ 0)
+unique(retailDF$PriceDiscount)
+retailDF
+```
+
+### Hyperparameter Tuning
+
+We tune our hyperparameters to give us the best possible model given our circumstances.
+
+```{r, message = FALSE, warning = FALSE, eval = FALSE}
+retailTask <- makeRegrTask(data = retailDF, target = 'Sales')
+forest <- makeLearner('regr.randomForest')
+forestParamSpace <- makeParamSet(
+  makeIntegerParam('ntree', lower = 50, upper = 50),
+  makeIntegerParam('mtry', lower = 3, upper = 10),
+  makeIntegerParam('nodesize', lower = 1, upper = 10),
+  makeIntegerParam('maxnodes', lower = 5, upper = 30)
+)
+randSearch <- makeTuneControlRandom(maxit = 150)
+repKFold <- makeResampleDesc('RepCV', folds = 10, reps = 5)
+
+parallelStartSocket(cpus = detectCores() - 1)
+tunedForestPars <- tuneParams(forest, task = retailTask, resampling = repKFold, par.set = forestParamSpace, control = randSearch)
+parallelStop()
+```
+
+### Model Training
+
+Using our tuned hyperparameters, we train our model.
+
+```{r, eval = FALSE}
+tunedForest <- setHyperPars(forest, par.vals = tunedForestPars$x)
+tunedForestModel <- train(tunedForest, retailTask)
+```
+
+### Prediction Testing
+
+Lets generate some fake data & use it to predict its sales values.
+
+```{r, message = FALSE, warning = FALSE, eval = FALSE}
+newData <- tibble(Product = 1:3,
+                  In_Store_Promo = c(0, 1, 0),
+                  PriceDiscount = 3:5,
+                  Catalogue_Promo = c(1, 0, 1),
+                  Store_End_Promo = c(0, 1, 0),
+                  Covid_Flag = c(1, 1, 0),
+                  Christmas = c(0, 1, 1),
+                  Week = 24:26,
+                  Year = 2017:2019)
+newData
+getPredictionResponse(predict(tunedForestModel, newdata = newData))
+```
+
+### Model 
+
+```{r, eval = FALSE}
+getLearnerModel(tunedForestModel)
+getTree(getLearnerModel(tunedForestModel))
+```
+
+### Further Examinations
+
+```{r}
+retailDF %>%
+  group_by(Product) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value')
+               
+ggplot(retailDF %>%
+  group_by(Product) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = Product, y = Value), fill = as.factor(Product)) +
+  geom_bar(stat = 'identity') +
+  facet_wrap(~ Measure) +
+  labs(title = 'Average & Median Sales of each Product')
+```
+
+```{r}
+retailDF %>%
+  group_by(Product, In_Store_Promo) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value') %>%
+  as.data.frame()
+               
+ggplot(retailDF %>%
+  group_by(Product, In_Store_Promo) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = Product, y = Value, fill = as.factor(In_Store_Promo))) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  facet_wrap(~ Measure) +
+  labs(title = 'Average & Median Sales of each Product \n w/ Store Promotions', fill = 'Store Promotion') +
+  scale_fill_manual(labels = c('No', 'Yes'), values = c('red', 'blue'))
+```
+
+```{r}
+retailDF %>%
+  group_by(PriceDiscount) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales))
+ggplot(retailDF %>%
+  group_by(PriceDiscount) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = PriceDiscount, y = Value), fill = as.factor(PriceDiscount)) +
+  geom_bar(stat = 'identity') +
+  facet_wrap(~ Measure) +
+  labs(title = 'Average & Median Sales based on Price Discounts')
+```
+
+```{r}
+retailDF %>%
+  group_by(Product, Catalogue_Promo) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value') %>%
+  as.data.frame()
+               
+ggplot(retailDF %>%
+  group_by(Product, Catalogue_Promo) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = Product, y = Value, fill = as.factor(Catalogue_Promo))) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  facet_wrap(~ Measure) +
+  labs(title = 'Average & Median Sales of each Product \n w/ Catalogue Promotions', fill = 'Catalogue Promotion') +
+  scale_fill_manual(labels = c('No', 'Yes'), values = c('red', 'blue'))
+```
+
+```{r}
+retailDF %>%
+  group_by(Product, Store_End_Promo) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value') %>%
+  as.data.frame()
+               
+ggplot(retailDF %>%
+  group_by(Product, Store_End_Promo) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = Product, y = Value, fill = as.factor(Store_End_Promo))) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  facet_wrap(~ Measure) +
+  labs(title = 'Average & Median Sales of each Product \n w/ Ending Promotions', fill = 'Ending Promotion') +
+  scale_fill_manual(labels = c('No', 'Yes'), values = c('red', 'blue'))
+```
+
+```{r}
+retailDF %>%
+  group_by(Product, Covid_Flag) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value') %>%
+  as.data.frame()
+               
+ggplot(retailDF %>%
+  group_by(Product, Covid_Flag) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = Product, y = Value, fill = as.factor(Covid_Flag))) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  facet_wrap(~ Measure) +
+  labs(title = 'Average & Median Sales of each Product \n w/ Store-Wide Covid Risk', fill = 'Covid Risk') +
+  scale_fill_manual(labels = c('No', 'Yes'), values = c('red', 'blue'))
+```
+
+```{r}
+retailDF %>%
+  group_by(Product, Christmas) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value') %>%
+  as.data.frame()
+               
+ggplot(retailDF %>%
+  group_by(Product, Christmas) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = Product, y = Value, fill = as.factor(Christmas))) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  facet_wrap(~ Measure) +
+  labs(title = 'Average & Median Sales of each Product \n on Christmas Day', fill = 'Christmas Day') +
+  scale_fill_manual(labels = c('No', 'Yes'), values = c('red', 'blue'))
+```
+
+```{r}
+retailDF %>%
+  group_by(Week) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value')
+               
+ggplot(retailDF %>%
+  group_by(Week) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = Week, y = Value), fill = as.factor(Week)) +
+  geom_bar(stat = 'identity') +
+  facet_wrap(~ Measure) +
+  labs(title = 'Average & Median Sales by Week')
+```
+
+```{r}
+retailDF %>%
+  group_by(Product, Year) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value')
+               
+ggplot(retailDF %>%
+  group_by(Product, Year) %>%
+  summarise(meanSales = mean(Sales),
+            medianSales = median(Sales)) %>%
+  pivot_longer(cols = c('meanSales', 'medianSales'), names_to = 'Measure', values_to = 'Value'),
+  aes(x = Product, y = Value), fill = as.factor(Measure)) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  facet_wrap(~ Year) +
+  labs(title = 'Average & Median Sales of each Product \n by Year', fill = 'Catalogue Promotion') +
+  scale_fill_manual(labels = c('No', 'Yes'), values = c('red', 'blue'))
+```
+
+***
+
+# ML Predictions Dashboard
+
+### UI
+
+```{r, eval = FALSE}
+ui <- fluidPage(
+  titlePanel('Retail Forecasting Project Predictive Dashboard'),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput(inputId = 'product', label = 'Product:', choices = c('SKU1', 'SKU2', 'SKU3', 'SKU4', 'SKU5', 'SKU6'), selected = 'SKU1'),
+      checkboxInput(inputId = 'inStorePromo', label = 'In-Store Promotion', value = FALSE),
+      sliderInput(inputId = 'discount', label = 'Discount (%):', min = 0, max = 90, value = 0, step = 1),
+      checkboxInput(inputId = 'cataloguePromo', label = 'Catalogue Promotion', value = FALSE),
+      checkboxInput(inputId = 'storeEndPromo', label = 'Store Ending Promotion', value = FALSE),
+      checkboxInput(inputId = 'covid', label = 'Covid Risk', value = FALSE),
+      checkboxInput(inputId = 'christmas', label = 'Christmas', value = FALSE),
+      dateInput(inputId = 'date', label = 'Date:', value = '2017-06-30', min = '2017-01-01', max = '2023-12-30', format = 'yyyy-mm-dd')
+    ),
+    mainPanel(
+      verbatimTextOutput(outputId = 'context'),
+      verbatimTextOutput(outputId = 'prediction')
+    )
+  )
+)
+```
+
+### Server
+
+```{r, eval = FALSE}
+server <- function(input, output, session) {
+  output$context <- renderText({'The predicted sales is below.'})
+  output$prediction <- renderText({ 
+    new_product <- as.numeric(str_remove(input$product, 'SKU'))
+    new_store_promo <- case_when(input$inStorePromo == FALSE ~ 0, TRUE ~ 1)
+    new_discount <- case_when(input$discount %in% 1:10 ~ 1,
+                              input$discount %in% 11:20 ~ 2,
+                              input$discount %in% 21:30 ~ 3,
+                              input$discount %in% 31:40 ~ 4,
+                              input$discount %in% 41:50 ~ 5,
+                              input$discount %in% 51:60 ~ 6,
+                              input$discount %in% 61:70 ~ 7,
+                              input$discount %in% 71:80 ~ 8,
+                              input$discount %in% 81:90 ~ 9,
+                              TRUE ~ 0)
+    new_catalogue_promo <- case_when(input$cataloguePromo == FALSE ~ 0, TRUE ~ 1)
+    new_end_promo <- case_when(input$storeEndPromo == FALSE ~ 0, TRUE ~ 1)
+    new_covid_risk <- case_when(input$covid == FALSE ~ 0, TRUE ~ 1)
+    new_christmas <- case_when(input$christmas == FALSE ~ 0, TRUE ~ 1)
+    new_week <- isoweek(ymd(input$date))
+    new_year <- isoyear(ymd(input$date))
+    new_data <- tibble(Product = new_product,
+                       In_Store_Promo = new_store_promo,
+                       PriceDiscount = new_discount,
+                       Catalogue_Promo = new_catalogue_promo,
+                       Store_End_Promo = new_end_promo,
+                       Covid_Flag = new_covid_risk,
+                       Christmas = new_christmas,
+                       Week = new_week,
+                       Year = new_year)
+    result <- getPredictionResponse(predict(tunedForestModel, newdata = new_data))
+    return(result)})
+}
+```
+
+### Run App
+
+```{r, eval = FALSE}
+shinyApp(ui, server)
+```
